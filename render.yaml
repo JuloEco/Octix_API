@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: octix-api
+    env: python
+    buildCommand: "pip install gunicorn flask pyjwt"
+    startCommand: "gunicorn app:app"
