@@ -29,15 +29,23 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 
-app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///octix.db"
+# Désactive la création automatique du dossier 'instance/' de Flask
+app = Flask(__name__, instance_relative_config=False)
+
+# Stocke SQLite dans le dossier temporaire /tmp (seul dossier inscriptible sur Vercel)
+# Ou utilise une base distante via variable d'environnement (ex: PostgreSQL / Neon / Supabase)
+db_uri = os.environ.get("DATABASE_URL", "sqlite:////tmp/octix.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# En prod : export OCTIX_SECRET_KEY="une-vraie-valeur-secrète-longue"
 SECRET_KEY = os.environ.get("OCTIX_SECRET_KEY", "change-moi-en-production")
 TOKEN_DURATION_HOURS = 12
 
 db = SQLAlchemy(app)
+
+# Initialise les tables au chargement du module
+with app.app_context():
+    db.create_all()
 
 
 class User(db.Model):
