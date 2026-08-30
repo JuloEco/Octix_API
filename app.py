@@ -116,7 +116,7 @@ def decode_token(token):
 
 @app.route("/register", methods=["POST"])
 def register():
-    data = request.get_json(silent=True) or request.form
+    data = request.get_json(silent=True, force=True) or request.form
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
 
@@ -136,7 +136,7 @@ def register():
 
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json(silent=True) or request.form
+    data = request.get_json(silent=True, force=True) or request.form
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
 
@@ -156,7 +156,7 @@ def login():
 def verify():
     token = (
         request.args.get("token")
-        or (request.get_json(silent=True) or {}).get("token")
+        or (request.get_json(silent=True, force=True) or {}).get("token")
         or request.form.get("token")
     )
     if not token:
