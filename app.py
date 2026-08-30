@@ -185,10 +185,6 @@ def debug():
         "content_length": request.content_length,
     })
 
-@app.route("/init-db-once")
-def init_db_once():
-    db.create_all()
-    return jsonify({"status": "tables créées"})
 
 # En local uniquement : sur Vercel, c'est api/index.py qui expose `app`,
 # et les tables doivent déjà exister (voir init_db.py) avant le déploiement.
