@@ -2,3 +2,4 @@ Flask
 Flask-SQLAlchemy
 PyJWT
 requests
+psycopg2
