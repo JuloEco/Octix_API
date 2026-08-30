@@ -173,6 +173,18 @@ def verify():
 def index():
     return jsonify({"service": "Octix", "status": "en ligne"})
 
+@app.route("/debug", methods=["GET", "POST"])
+def debug():
+    return jsonify({
+        "method": request.method,
+        "args": request.args.to_dict(),
+        "form": request.form.to_dict(),
+        "json": request.get_json(silent=True, force=True),
+        "raw_data": request.get_data(as_text=True),
+        "content_type": request.content_type,
+        "content_length": request.content_length,
+    })
+
 
 # En local uniquement : sur Vercel, c'est api/index.py qui expose `app`,
 # et les tables doivent déjà exister (voir init_db.py) avant le déploiement.
