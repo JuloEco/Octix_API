@@ -4,22 +4,33 @@ Octix — service d'authentification centralisé
 Un point d'entrée unique pour créer des comptes, se connecter,
 et VÉRIFIER un token depuis n'importe quelle autre app (LearnCode, classroom, etc.)
 
-Installation :
-    pip install flask flask_sqlalchemy pyjwt --break-system-packages
+Version adaptée pour Vercel : utilise une vraie base Postgres (Vercel Postgres,
+Neon, Supabase...) au lieu de SQLite, car le système de fichiers de Vercel est
+en lecture seule (sauf /tmp, qui n'est PAS persistant entre deux invocations
+de la fonction serverless). Avec SQLite sur /tmp, chaque cold start repartirait
+d'une base vide : les comptes créés disparaîtraient.
 
-Lancement :
+Installation :
+    pip install flask flask_sqlalchemy pyjwt psycopg2-binary --break-system-packages
+
+Lancement en local (avec Postgres) :
+    export POSTGRES_URL="postgresql://user:password@host:5432/dbname"
+    export OCTIX_SECRET_KEY="une-vraie-cle-secrete"
     python octix.py
     -> service disponible sur http://localhost:5050
+
+Déploiement sur Vercel :
+    1. Ajoute l'intégration "Vercel Postgres" (ou Neon/Supabase) à ton projet
+       -> Vercel injecte automatiquement POSTGRES_URL / POSTGRES_URL_NON_POOLING
+    2. Définis OCTIX_SECRET_KEY dans les variables d'environnement du projet
+    3. Crée les tables UNE SEULE FOIS avant le premier déploiement (voir init_db.py),
+       plutôt que de compter sur db.create_all() à chaque cold start
+    4. Déploie via `vercel` (voir vercel.json + api/index.py)
 
 Endpoints :
     POST /register   {username, password}   -> 201 (compte créé) / 409 (existe déjà)
     POST /login       {username, password}   -> {token, username, expires_in_hours}
     GET|POST /verify   {token}                -> {valid: true, username} ou {valid: false, error}
-
-Pour la prod, pense à :
-    - fixer OCTIX_SECRET_KEY dans les variables d'environnement (pas la valeur par défaut)
-    - passer à une vraie base (Postgres) plutôt que SQLite
-    - servir en HTTPS
 """
 
 import os
@@ -29,23 +40,45 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Désactive la création automatique du dossier 'instance/' de Flask
-app = Flask(__name__, instance_relative_config=False)
+app = Flask(__name__)
 
-# Stocke SQLite dans le dossier temporaire /tmp (seul dossier inscriptible sur Vercel)
-# Ou utilise une base distante via variable d'environnement (ex: PostgreSQL / Neon / Supabase)
-db_uri = os.environ.get("DATABASE_URL", "sqlite:////tmp/octix.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
+
+def _normalize_db_url(url: str) -> str:
+    """Vercel Postgres / Heroku-style fournissent souvent 'postgres://',
+    or SQLAlchemy 1.4+ exige le préfixe 'postgresql://'."""
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+# Ordre de priorité des variables d'environnement :
+# - POSTGRES_URL_NON_POOLING : connexion directe (sans pgbouncer), utile pour
+#   les opérations de schéma (create_all, migrations)
+# - POSTGRES_URL : connexion "pooled" fournie automatiquement par l'intégration
+#   Vercel Postgres, à utiliser pour les requêtes normales de l'app
+# - DATABASE_URL : fallback générique si tu utilises Neon/Supabase directement
+# - sqlite en mémoire : UNIQUEMENT pour tourner le code sans base configurée
+#   (tests rapides) — ne jamais utiliser en prod sur Vercel
+db_uri = (
+    os.environ.get("POSTGRES_URL")
+    or os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL_NON_POOLING")
+    or "sqlite:///:memory:"
+)
+app.config["SQLALCHEMY_DATABASE_URI"] = _normalize_db_url(db_uri)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    # essentiel en environnement serverless : évite d'utiliser une connexion
+    # que la base a déjà fermée de son côté entre deux invocations
+    "pool_pre_ping": True,
+    # recycle la connexion avant que le Postgres managé ne la coupe lui-même
+    "pool_recycle": 280,
+}
 
 SECRET_KEY = os.environ.get("OCTIX_SECRET_KEY", "change-moi-en-production")
 TOKEN_DURATION_HOURS = 12
 
 db = SQLAlchemy(app)
-
-# Initialise les tables au chargement du module
-with app.app_context():
-    db.create_all()
 
 
 class User(db.Model):
@@ -141,6 +174,8 @@ def index():
     return jsonify({"service": "Octix", "status": "en ligne"})
 
 
+# En local uniquement : sur Vercel, c'est api/index.py qui expose `app`,
+# et les tables doivent déjà exister (voir init_db.py) avant le déploiement.
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
