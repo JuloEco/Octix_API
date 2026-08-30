@@ -1,5 +1,4 @@
-Flask
-Flask-SQLAlchemy
-PyJWT
-requests
-psycopg2
+flask
+flask_sqlalchemy
+pyjwt
+psycopg2-binary
