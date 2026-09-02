@@ -37,6 +37,13 @@ Endpoints publics (utilisés par les apps clientes) :
         -> comble les champs manquants sur un compte créé avant leur ajout,
            sans jamais toucher au mot de passe (voir missing_fields ci-dessus)
 
+Endpoints de gestion de compte (Authorization: Bearer <token>, obtenu via /login) :
+    GET    /account/me                    -> profil (username, email, classroom_role, created_at)
+    PUT    /account/classroom-role  {classroom_role}                      -> {ok, classroom_role}
+    PUT    /account/password        {current_password, new_password}      -> {ok} ou 403 si mdp actuel faux
+    DELETE /account                 {password}                            -> {ok} ou 403 si mdp faux
+    GET    /account/learncode-progress    -> progression LearnCode (lue directement dans sa table)
+
 Endpoints internes (utilisés uniquement par le portail Octix, jamais par un
 navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est défini) :
     GET  /user/<username>/email      -> {email} ou 404
@@ -44,10 +51,12 @@ navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est
 """
 
 import os
+import json
 import datetime
 import jwt
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
@@ -146,6 +155,32 @@ def decode_token(token):
         return None, "token expiré"
     except jwt.InvalidTokenError:
         return None, "token invalide"
+
+
+def token_required(view_func):
+    """Protège une route avec le token JWT obtenu au login. Injecte l'objet
+    User correspondant en premier argument de la vue (comme g.user ailleurs,
+    mais explicite pour rester simple ici)."""
+    from functools import wraps
+
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+        if not token:
+            return jsonify({"error": "authentification requise (Authorization: Bearer <token>)"}), 401
+
+        payload, error = decode_token(token)
+        if error:
+            return jsonify({"error": error}), 401
+
+        user = User.query.filter_by(username=payload["sub"]).first()
+        if not user:
+            return jsonify({"error": "compte introuvable"}), 404
+
+        return view_func(user, *args, **kwargs)
+
+    return wrapped
 
 
 def _internal_auth_ok(req) -> bool:
@@ -264,6 +299,105 @@ def reset_password():
     user.set_password(new_password)
     db.session.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/account/me", methods=["GET"])
+@token_required
+def account_me(user):
+    """Profil complet du compte connecté (jamais le mot de passe, même hashé)."""
+    return jsonify({
+        "username": user.username,
+        "email": user.email,
+        "classroom_role": user.classroom_role,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    })
+
+
+@app.route("/account/classroom-role", methods=["PUT"])
+@token_required
+def account_update_classroom_role(user):
+    data = request.get_json(silent=True, force=True) or request.form
+    role = (data.get("classroom_role") or "").strip().lower()
+    if role not in ("prof", "eleve"):
+        return jsonify({"error": "classroom_role doit être 'prof' ou 'eleve'"}), 400
+
+    user.classroom_role = role
+    db.session.commit()
+    return jsonify({"ok": True, "classroom_role": user.classroom_role})
+
+
+@app.route("/account/password", methods=["PUT"])
+@token_required
+def account_change_password(user):
+    """Contrairement à /reset-password (interne, déclenché par un code e-mail),
+    ici on exige le mot de passe ACTUEL : c'est l'utilisateur lui-même,
+    déjà connecté, qui choisit de le changer depuis son compte."""
+    data = request.get_json(silent=True, force=True) or request.form
+    current_password = data.get("current_password") or ""
+    new_password = data.get("new_password") or ""
+
+    if not user.check_password(current_password):
+        return jsonify({"error": "mot de passe actuel incorrect"}), 403
+    if len(new_password) < 6:
+        return jsonify({"error": "le nouveau mot de passe doit faire au moins 6 caractères"}), 400
+
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/account", methods=["DELETE"])
+@token_required
+def account_delete(user):
+    """Suppression définitive du compte Octix. Exige le mot de passe en
+    confirmation — un token seul (qui peut fuiter, rester dans un onglet
+    oublié...) ne suffit jamais à autoriser une action aussi irréversible.
+    Ne supprime QUE le compte Octix (identité + auth) : les données propres
+    à chaque app (progression LearnCode, devoirs...) restent gérées par ces
+    apps elles-mêmes."""
+    data = request.get_json(silent=True, force=True) or request.form
+    password = data.get("password") or ""
+
+    if not user.check_password(password):
+        return jsonify({"error": "mot de passe incorrect"}), 403
+
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/account/learncode-progress", methods=["GET"])
+@token_required
+def account_learncode_progress(user):
+    """Lit la progression LearnCode directement depuis sa table brute
+    (gérée par LearnCode via psycopg2, pas par ce modèle SQLAlchemy) --
+    mais sur la même base Postgres, donc accessible sans appeler une
+    autre API réseau. Une seule source de vérité pour le format des
+    données : LearnCode lui-même (voir get_level_data côté LearnCode)."""
+    row = db.session.execute(
+        text('SELECT data FROM users WHERE id = :username'),
+        {"username": user.username},
+    ).fetchone()
+
+    if not row:
+        return jsonify({"has_progress": False})
+
+    raw = row[0]
+    data = raw if isinstance(raw, dict) else json.loads(raw)
+
+    score = data.get("score", 0)
+    level = (score // 100) + 1
+    progress_in_level = score % 100
+
+    return jsonify({
+        "has_progress": True,
+        "xp": score,
+        "level": level,
+        "progress_in_level": progress_in_level,
+        "next_level_xp": 100,
+        "cours_notes": data.get("notes", {}),
+        "cours_completes": len(data.get("notes", {})),
+    })
 
 
 @app.route("/complete-profile", methods=["POST"])
