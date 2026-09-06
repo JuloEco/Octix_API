@@ -194,6 +194,15 @@ def _internal_auth_ok(req) -> bool:
     return req.headers.get("X-Internal-Key") == INTERNAL_KEY
 
 
+# Créé les tables manquantes au chargement du module. Contrairement à un appel
+# placé uniquement dans `if __name__ == "__main__":`, ce bloc s'exécute aussi
+# quand gunicorn importe ce fichier (cas de la prod sur Render) — sans quoi
+# les tables ne sont jamais créées et /register, /login échouent avec une
+# erreur 500 (table inexistante).
+with app.app_context():
+    db.create_all()
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True, force=True) or request.form
@@ -463,9 +472,8 @@ def debug():
     })
 
 
-# En local uniquement : sur Vercel, c'est api/index.py qui expose `app`,
-# et les tables doivent déjà exister (voir init_db.py) avant le déploiement.
+# En local uniquement : sur Vercel, c'est api/index.py qui expose `app`.
+# db.create_all() s'exécute désormais au chargement du module (voir plus haut),
+# donc plus besoin de le refaire ici.
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
     app.run(debug=True, port=5050)
