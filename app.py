@@ -309,6 +309,13 @@ def reset_password():
     db.session.commit()
     return jsonify({"ok": True})
 
+@app.route("/admin/users", methods=["GET"])
+def admin_list_users():
+    if request.headers.get("X-Internal-Key") != os.environ.get("OCTIX_INTERNAL_KEY"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    users = User.query.all()  # adapte selon ton modèle SQLAlchemy
+    return jsonify({"users": [{"email": u.email} for u in users if u.email]}), 200
 
 @app.route("/account/me", methods=["GET"])
 @token_required
