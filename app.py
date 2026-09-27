@@ -24,9 +24,11 @@ Déploiement sur Vercel :
     1. Ajoute l'intégration "Vercel Postgres" (ou Neon/Supabase) à ton projet
        -> Vercel injecte automatiquement POSTGRES_URL / POSTGRES_URL_NON_POOLING
     2. Définis OCTIX_SECRET_KEY et OCTIX_INTERNAL_KEY dans les variables d'environnement
+       (et, si besoin, DAILY_TOKEN_QUOTA — défaut 500)
     3. Si la table "user" existe déjà (déploiement pré-existant), lance
-       migrate_add_email.py UNE FOIS avant de déployer cette version : db.create_all()
-       ne modifie jamais une table déjà créée, il ne crée que les tables manquantes.
+       migrate_add_email.py puis migrate_add_quota.py UNE FOIS avant de déployer
+       cette version : db.create_all() ne modifie jamais une table déjà créée,
+       il ne crée que les tables manquantes.
     4. Déploie via `vercel` (voir vercel.json + api/index.py)
 
 Endpoints publics (utilisés par les apps clientes) :
@@ -54,11 +56,18 @@ Endpoint machine-à-machine (utilisé par les apps clientes pour s'authentifier 
 une clé API plutôt qu'un token JWT — utile pour un appel serveur-à-serveur sans
 passer par /login) :
     GET|POST /verify-api-key  {api_key}     -> {valid: true, username} ou {valid: false, error}
-    GET  /api-key/status   (X-API-Key)                    -> {remaining} ou 401
-    POST /api-key/usage    (X-API-Key) {tokens}            -> {remaining} ou 401
-        Quota journalier partagé par toutes les apps qui s'authentifient par
-        clé API (500 tokens/jour par compte, remis à zéro chaque jour) --
-        utilisé par Opsiom-run-PC.py avant/après chaque génération.
+
+Quota de tokens partagé par COMPTE (Authorization: Bearer <token> OU X-Api-Key /
+api_key — les deux résolvent le même compte, donc le même compteur) :
+    GET  /account/quota                    -> {used, limit, remaining}
+    POST /account/quota/consume  {tokens}  -> décompte "tokens" sur le compteur du
+                                               jour et renvoie le nouveau statut, ou
+                                               409/429 si le quota est déjà atteint.
+    Le compteur est attaché au COMPTE (colonnes tokens_used_today / quota_date sur
+    User), jamais à la clé API elle-même : régénérer sa clé API ne le remet donc
+    plus à zéro, et créer plusieurs clés pour un même compte ne donne plusieurs
+    quotas — un compte = un quota, quel que soit le nombre de clés ou d'apps qui
+    l'utilisent (portail web, CLI...).
 
 Endpoints internes (utilisés uniquement par le portail Octix, jamais par un
 navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est défini) :
@@ -121,6 +130,10 @@ TOKEN_DURATION_HOURS = 12
 # à définir obligatoirement avant tout déploiement public.
 INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
 
+# Quota de tokens/jour partagé par compte (web + CLI + toute autre app qui
+# passe par /account/quota/consume). 500 par défaut.
+DAILY_TOKEN_QUOTA = int(os.environ.get("DAILY_TOKEN_QUOTA", "500"))
+
 db = SQLAlchemy(app)
 
 
@@ -140,29 +153,18 @@ class User(db.Model):
     api_key_preview = db.Column(db.String(20), nullable=True)
     api_key_created_at = db.Column(db.DateTime, nullable=True)
 
+    # Quota de tokens/jour, PARTAGÉ entre toutes les apps et toutes les clés
+    # du compte (voir /account/quota/consume) : attaché à l'utilisateur, pas
+    # à une clé API, pour qu'il ne suffise pas de régénérer sa clé (ou d'en
+    # créer une par app) pour repartir avec un quota frais.
+    tokens_used_today = db.Column(db.Integer, default=0, nullable=False)
+    quota_date = db.Column(db.Date, default=datetime.date.today, nullable=False)
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
-
-
-# Quota journalier des clés API (utilisé par Opsiom, et par toute future
-# app de l'écosystème qui exigerait une clé API). Table séparée de "user" :
-# un jour par ligne, remise à zéro automatique dès que la date change --
-# pas besoin de tâche planifiée pour "réinitialiser" quoi que ce soit.
-DAILY_TOKEN_QUOTA = 500
-
-
-class ApiKeyQuota(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    usage_date = db.Column(db.Date, nullable=False, default=datetime.date.today)
-    tokens_used = db.Column(db.Integer, nullable=False, default=0)
-
-    __table_args__ = (
-        db.UniqueConstraint("user_id", "usage_date", name="uq_api_key_quota_user_day"),
-    )
 
 
 REQUIRED_PROFILE_FIELDS = ("email", "classroom_role")
@@ -391,6 +393,7 @@ def account_me(user):
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "api_key_preview": user.api_key_preview,
         "api_key_created_at": user.api_key_created_at.isoformat() if user.api_key_created_at else None,
+        "quota": _quota_status(user),
     })
 
 
@@ -447,59 +450,92 @@ def verify_api_key():
     return jsonify({"valid": True, "username": user.username})
 
 
-def _user_from_request_api_key():
-    """Récupère l'utilisateur associé à la clé API envoyée dans l'en-tête
-    X-API-Key, ou None si absente/invalide. Même logique de recherche que
-    /verify-api-key, mais lit l'en-tête plutôt que le body -- c'est ainsi
-    qu'Opsiom-run-PC.py (et toute future app machine-à-machine) l'envoie."""
-    api_key = (request.headers.get("X-API-Key") or "").strip()
-    if not api_key:
-        return None
-    return User.query.filter_by(api_key_hash=hash_api_key(api_key)).first()
+def _resolve_quota_user(req):
+    """Retrouve le compte appelant depuis un token JWT (Authorization: Bearer)
+    OU une clé API (header X-Api-Key, ou 'api_key' en JSON/query/form).
+
+    C'est cette double entrée qui permet au portail web (qui n'a qu'un token
+    de session) et au CLI / serveur d'inférence (qui n'a qu'une clé API) de
+    partager EXACTEMENT le même compteur : les deux chemins retombent sur le
+    même User, donc sur les mêmes colonnes tokens_used_today / quota_date."""
+    auth_header = req.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+    if token:
+        payload, error = decode_token(token)
+        if error:
+            return None, error
+        user = User.query.filter_by(username=payload["sub"]).first()
+        if not user:
+            return None, "compte introuvable"
+        return user, None
+
+    api_key = (
+        req.headers.get("X-Api-Key")
+        or (req.get_json(silent=True, force=True) or {}).get("api_key")
+        or req.args.get("api_key")
+        or req.form.get("api_key")
+    )
+    if api_key:
+        user = User.query.filter_by(api_key_hash=hash_api_key(api_key)).first()
+        if not user:
+            return None, "clé API invalide"
+        return user, None
+
+    return None, "authentification requise (Authorization: Bearer <token> ou X-Api-Key)"
 
 
-def _get_or_create_quota_row(user):
-    row = ApiKeyQuota.query.filter_by(user_id=user.id, usage_date=datetime.date.today()).first()
-    if row is None:
-        row = ApiKeyQuota(user_id=user.id, usage_date=datetime.date.today(), tokens_used=0)
-        db.session.add(row)
-        db.session.commit()
-    return row
+def _reset_quota_if_needed(user):
+    if user.quota_date != datetime.date.today():
+        user.quota_date = datetime.date.today()
+        user.tokens_used_today = 0
 
 
-@app.route("/api-key/status", methods=["GET"])
-def api_key_status():
-    """Appelé par Opsiom (et toute app cliente) AVANT de traiter une requête :
-    la clé est-elle valide, et combien reste-t-il de tokens aujourd'hui ?"""
-    user = _user_from_request_api_key()
-    if not user:
-        return jsonify({"error": "clé API invalide"}), 401
-
-    row = _get_or_create_quota_row(user)
-    remaining = max(0, DAILY_TOKEN_QUOTA - row.tokens_used)
-    return jsonify({"remaining": remaining})
+def _quota_status(user):
+    _reset_quota_if_needed(user)
+    return {
+        "used": user.tokens_used_today,
+        "limit": DAILY_TOKEN_QUOTA,
+        "remaining": max(0, DAILY_TOKEN_QUOTA - user.tokens_used_today),
+    }
 
 
-@app.route("/api-key/usage", methods=["POST"])
-def api_key_usage():
-    """Appelé par Opsiom APRÈS chaque génération, avec le nombre réel de
-    tokens consommés (prompt + réponse) : c'est ici, et seulement ici, que
-    le quota est décompté pour de vrai."""
-    user = _user_from_request_api_key()
-    if not user:
-        return jsonify({"error": "clé API invalide"}), 401
+@app.route("/account/quota", methods=["GET"])
+def account_quota():
+    """Statut du quota de tokens du compte appelant, sans le décompter."""
+    user, error = _resolve_quota_user(request)
+    if error:
+        return jsonify({"error": error}), 401
+    status = _quota_status(user)
+    db.session.commit()  # persiste un éventuel reset de date déclenché ci-dessus
+    return jsonify(status)
+
+
+@app.route("/account/quota/consume", methods=["POST"])
+def account_quota_consume():
+    """Décompte 'tokens' sur le quota quotidien du compte appelant.
+
+    Le quota est vérifié avant décompte (refus 429 si déjà à zéro) et
+    partagé par TOUT le compte : peu importe que l'appel vienne de la
+    session web ou d'une clé API (même régénérée), c'est le même compteur
+    qui est débité — voir _resolve_quota_user ci-dessus."""
+    user, error = _resolve_quota_user(request)
+    if error:
+        return jsonify({"error": error}), 401
 
     data = request.get_json(silent=True, force=True) or {}
-    tokens = data.get("tokens")
-    if not isinstance(tokens, int) or tokens < 0:
-        return jsonify({"error": "tokens doit être un entier positif"}), 400
+    try:
+        tokens = max(0, int(data.get("tokens", 0)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'tokens' doit être un entier"}), 400
 
-    row = _get_or_create_quota_row(user)
-    row.tokens_used += tokens
+    _reset_quota_if_needed(user)
+    if user.tokens_used_today >= DAILY_TOKEN_QUOTA:
+        db.session.commit()
+        return jsonify({"error": "quota quotidien de tokens atteint", "quota": _quota_status(user)}), 429
+
+    user.tokens_used_today += tokens
     db.session.commit()
-
-    remaining = max(0, DAILY_TOKEN_QUOTA - row.tokens_used)
-    return jsonify({"remaining": remaining})
+    return jsonify({"ok": True, "quota": _quota_status(user)})
 
 
 @app.route("/account/classroom-role", methods=["PUT"])
