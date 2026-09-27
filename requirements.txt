@@ -1,4 +1,4 @@
 flask
 flask_sqlalchemy
 pyjwt
-psycopg2-binary
+psycopg[binary]
