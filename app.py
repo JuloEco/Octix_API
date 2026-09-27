@@ -38,11 +38,22 @@ Endpoints publics (utilisés par les apps clientes) :
            sans jamais toucher au mot de passe (voir missing_fields ci-dessus)
 
 Endpoints de gestion de compte (Authorization: Bearer <token>, obtenu via /login) :
-    GET    /account/me                    -> profil (username, email, classroom_role, created_at)
+    GET    /account/me                    -> profil (username, email, classroom_role, created_at,
+                                              api_key_preview, api_key_created_at)
     PUT    /account/classroom-role  {classroom_role}                      -> {ok, classroom_role}
     PUT    /account/password        {current_password, new_password}      -> {ok} ou 403 si mdp actuel faux
     DELETE /account                 {password}                            -> {ok} ou 403 si mdp faux
     GET    /account/learncode-progress    -> progression LearnCode (lue directement dans sa table)
+    POST   /account/api-key               -> génère (ou régénère) une clé API pour le compte.
+                                              La clé en clair n'est renvoyée QUE dans cette réponse
+                                              ({api_key, api_key_preview, api_key_created_at}) ; elle
+                                              n'est jamais stockée ni ré-affichée ensuite (seul le
+                                              hash l'est). Régénérer invalide immédiatement l'ancienne.
+
+Endpoint machine-à-machine (utilisé par les apps clientes pour s'authentifier avec
+une clé API plutôt qu'un token JWT — utile pour un appel serveur-à-serveur sans
+passer par /login) :
+    GET|POST /verify-api-key  {api_key}     -> {valid: true, username} ou {valid: false, error}
 
 Endpoints internes (utilisés uniquement par le portail Octix, jamais par un
 navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est défini) :
@@ -52,6 +63,8 @@ navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est
 
 import os
 import json
+import secrets
+import hashlib
 import datetime
 import jwt
 from flask import Flask, request, jsonify
@@ -113,6 +126,14 @@ class User(db.Model):
     classroom_role = db.Column(db.String(20), nullable=True)  # 'prof' ou 'eleve'
     password_hash = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    # Clé API : on ne stocke jamais la clé en clair, seulement son hash SHA-256
+    # (contrairement au mot de passe, une clé API est déjà un secret à haute
+    # entropie généré aléatoirement — un hash rapide suffit, pas besoin du
+    # coût volontaire de bcrypt/werkzeug qui vise à ralentir le brute-force
+    # sur des mots de passe choisis par un humain).
+    api_key_hash = db.Column(db.String(64), unique=True, nullable=True)
+    api_key_preview = db.Column(db.String(20), nullable=True)
+    api_key_created_at = db.Column(db.DateTime, nullable=True)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -155,6 +176,25 @@ def decode_token(token):
         return None, "token expiré"
     except jwt.InvalidTokenError:
         return None, "token invalide"
+
+
+def generate_api_key():
+    """Clé lisible et préfixée (façon Stripe/GitHub) : le préfixe permet de
+    reconnaître une clé Octix au premier coup d'œil (dans un log, un .env...),
+    token_urlsafe(32) donne ~256 bits d'entropie, largement assez pour ne
+    jamais nécessiter de vérifier son unicité en base avant insertion."""
+    return f"octix_{secrets.token_urlsafe(32)}"
+
+
+def hash_api_key(api_key):
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def preview_api_key(api_key):
+    """Aperçu affiché dans l'espace compte : jamais assez pour reconstituer
+    la clé, juste de quoi la reconnaître parmi plusieurs (ex. après une
+    régénération)."""
+    return f"{api_key[:10]}…{api_key[-4:]}"
 
 
 def token_required(view_func):
@@ -326,7 +366,62 @@ def account_me(user):
         "email": user.email,
         "classroom_role": user.classroom_role,
         "created_at": user.created_at.isoformat() if user.created_at else None,
+        "api_key_preview": user.api_key_preview,
+        "api_key_created_at": user.api_key_created_at.isoformat() if user.api_key_created_at else None,
     })
+
+
+@app.route("/account/api-key", methods=["POST"])
+@token_required
+def account_generate_api_key(user):
+    """Génère une nouvelle clé API pour le compte connecté. Si une clé
+    existait déjà, elle est immédiatement invalidée (un seul hash stocké
+    par compte) : c'est ce qui justifie l'avertissement de confirmation
+    côté portail avant de régénérer. La clé en clair n'est renvoyée
+    qu'ici, une seule fois -- elle n'est jamais récupérable ensuite."""
+    api_key = generate_api_key()
+    user.api_key_hash = hash_api_key(api_key)
+    user.api_key_preview = preview_api_key(api_key)
+    user.api_key_created_at = datetime.datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "api_key": api_key,
+        "api_key_preview": user.api_key_preview,
+        "api_key_created_at": user.api_key_created_at.isoformat(),
+    }), 201
+
+
+@app.route("/account/api-key", methods=["DELETE"])
+@token_required
+def account_revoke_api_key(user):
+    """Révoque la clé API du compte sans en générer une nouvelle."""
+    user.api_key_hash = None
+    user.api_key_preview = None
+    user.api_key_created_at = None
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/verify-api-key", methods=["GET", "POST"])
+def verify_api_key():
+    """Équivalent de /verify mais pour une clé API plutôt qu'un token JWT --
+    pensé pour un appel serveur-à-serveur (une app cliente qui a stocké la
+    clé API d'un compte dans sa propre config, sans repasser par /login)."""
+    api_key = (
+        request.args.get("api_key")
+        or (request.get_json(silent=True, force=True) or {}).get("api_key")
+        or request.form.get("api_key")
+    )
+    if not api_key:
+        return jsonify({"valid": False, "error": "api_key manquante"}), 400
+
+    user = User.query.filter_by(api_key_hash=hash_api_key(api_key)).first()
+    if not user:
+        return jsonify({"valid": False, "error": "clé API invalide"}), 401
+
+    return jsonify({"valid": True, "username": user.username})
 
 
 @app.route("/account/classroom-role", methods=["PUT"])
