@@ -26,7 +26,8 @@ Déploiement sur Vercel :
     2. Définis OCTIX_SECRET_KEY et OCTIX_INTERNAL_KEY dans les variables d'environnement
        (et, si besoin, DAILY_TOKEN_QUOTA — défaut 500)
     3. Si la table "user" existe déjà (déploiement pré-existant), lance
-       migrate_add_email.py puis migrate_add_quota.py UNE FOIS avant de déployer
+       migrate_add_email.py, migrate_add_quota.py puis migrate_add_plans.py
+       UNE FOIS avant de déployer
        cette version : db.create_all() ne modifie jamais une table déjà créée,
        il ne crée que les tables manquantes.
     4. Déploie via `vercel` (voir vercel.json + api/index.py)
@@ -69,6 +70,15 @@ api_key — les deux résolvent le même compte, donc le même compteur) :
     quotas — un compte = un quota, quel que soit le nombre de clés ou d'apps qui
     l'utilisent (portail web, CLI...).
 
+Forfaits (Free / Plus / Pro, voir plans.py) — le quota ci-dessus dépend du forfait
+du compte, qui se débloque en accomplissant des missions LearnCode / Classroom /
+Omnia Mind / Opsiom (lues directement dans la base commune, voir progression.py) :
+    GET  /account/progression[?force=1]  -> forfait courant, missions par forfait,
+                                             quota (token JWT ou clé API). Passe le
+                                             compte au forfait supérieur si mérité.
+    POST /admin/plan  {username, plan}   -> force un forfait   (X-Internal-Key obligatoire)
+    POST /admin/lab   {username, lab}    -> statut Opsiom Lab  (X-Internal-Key obligatoire)
+
 Endpoints internes (utilisés uniquement par le portail Octix, jamais par un
 navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est défini) :
     GET  /user/<username>/email      -> {email} ou 404
@@ -85,6 +95,9 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from werkzeug.security import generate_password_hash, check_password_hash
+
+import plans
+import progression
 
 app = Flask(__name__)
 
@@ -131,8 +144,16 @@ TOKEN_DURATION_HOURS = 12
 INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
 
 # Quota de tokens/jour partagé par compte (web + CLI + toute autre app qui
-# passe par /account/quota/consume). 500 par défaut.
-DAILY_TOKEN_QUOTA = int(os.environ.get("DAILY_TOKEN_QUOTA", "500"))
+# passe par /account/quota/consume). Il dépend désormais du FORFAIT du compte
+# (voir plans.py : free 500 / plus 10 000 / pro 50 000). Cette variable
+# d'environnement ne surcharge plus que le forfait "free", pour pouvoir
+# ajuster le quota par défaut sans redéployer le code.
+if os.environ.get("DAILY_TOKEN_QUOTA"):
+    plans.PLANS["free"]["daily_tokens"] = int(os.environ["DAILY_TOKEN_QUOTA"])
+
+# Intervalle minimum entre deux recalculs de progression pour un même compte
+# (les lectures traversent les tables de 3 apps : inutile à chaque message).
+PROGRESSION_TTL_SECONDS = int(os.environ.get("PROGRESSION_TTL_SECONDS", "300"))
 
 db = SQLAlchemy(app)
 
@@ -159,6 +180,41 @@ class User(db.Model):
     # créer une par app) pour repartir avec un quota frais.
     tokens_used_today = db.Column(db.Integer, default=0, nullable=False)
     quota_date = db.Column(db.Date, default=datetime.date.today, nullable=False)
+
+    # --- Forfait (voir plans.py) -----------------------------------------
+    plan = db.Column(db.String(16), default=plans.DEFAULT_PLAN, nullable=False)
+    plan_updated_at = db.Column(db.DateTime, nullable=True)
+    # Statut Lab : séparé des forfaits (bêta-testeurs). Attribution manuelle
+    # via /admin/lab pour l'instant ; aucun avantage concret tant qu'aucun
+    # modèle expérimental n'existe.
+    lab = db.Column(db.Boolean, default=False, nullable=False)
+
+    # --- Activité Opsiom, alimentée par /account/quota/consume : sert aux
+    # missions "utiliser Opsiom N jours" / "N conversations". Liste JSON de
+    # dates ISO (90 dernières) — suffisant pour compter des jours distincts.
+    active_days_json = db.Column(db.Text, default="[]", nullable=False)
+    conversations_total = db.Column(db.Integer, default=0, nullable=False)
+
+    # Cache de progression (recalcul au plus toutes les PROGRESSION_TTL_SECONDS)
+    progression_json = db.Column(db.Text, nullable=True)
+    progression_checked_at = db.Column(db.DateTime, nullable=True)
+
+    def opsiom_activity_stats(self):
+        try:
+            days = json.loads(self.active_days_json or "[]")
+        except (ValueError, TypeError):
+            days = []
+        return {"active_days": len(days), "conversations": self.conversations_total or 0}
+
+    def record_opsiom_activity(self):
+        today = datetime.date.today().isoformat()
+        try:
+            days = set(json.loads(self.active_days_json or "[]"))
+        except (ValueError, TypeError):
+            days = set()
+        days.add(today)
+        self.active_days_json = json.dumps(sorted(days)[-90:])
+        self.conversations_total = (self.conversations_total or 0) + 1
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -394,6 +450,8 @@ def account_me(user):
         "api_key_preview": user.api_key_preview,
         "api_key_created_at": user.api_key_created_at.isoformat() if user.api_key_created_at else None,
         "quota": _quota_status(user),
+        "plan": user.plan,
+        "lab": bool(user.lab),
     })
 
 
@@ -492,10 +550,13 @@ def _reset_quota_if_needed(user):
 
 def _quota_status(user):
     _reset_quota_if_needed(user)
+    limit = plans.daily_tokens_for(user.plan)
     return {
         "used": user.tokens_used_today,
-        "limit": DAILY_TOKEN_QUOTA,
-        "remaining": max(0, DAILY_TOKEN_QUOTA - user.tokens_used_today),
+        "limit": limit,
+        "remaining": max(0, limit - user.tokens_used_today),
+        "plan": user.plan,
+        "lab": bool(user.lab),
     }
 
 
@@ -505,6 +566,7 @@ def account_quota():
     user, error = _resolve_quota_user(request)
     if error:
         return jsonify({"error": error}), 401
+    _maybe_refresh_progression(user)
     status = _quota_status(user)
     db.session.commit()  # persiste un éventuel reset de date déclenché ci-dessus
     return jsonify(status)
@@ -528,12 +590,15 @@ def account_quota_consume():
     except (TypeError, ValueError):
         return jsonify({"error": "'tokens' doit être un entier"}), 400
 
+    _maybe_refresh_progression(user)
     _reset_quota_if_needed(user)
-    if user.tokens_used_today >= DAILY_TOKEN_QUOTA:
+    if user.tokens_used_today >= plans.daily_tokens_for(user.plan):
         db.session.commit()
         return jsonify({"error": "quota quotidien de tokens atteint", "quota": _quota_status(user)}), 429
 
     user.tokens_used_today += tokens
+    if tokens > 0:
+        user.record_opsiom_activity()
     db.session.commit()
     return jsonify({"ok": True, "quota": _quota_status(user)})
 
@@ -623,6 +688,143 @@ def account_learncode_progress(user):
         "cours_notes": data.get("notes", {}),
         "cours_completes": len(data.get("notes", {})),
     })
+
+
+# ---------------------------------------------------------------------------
+# Forfaits & progression (voir plans.py / progression.py)
+# ---------------------------------------------------------------------------
+def _refresh_progression(user, force=False):
+    """Recalcule (ou relit le cache de) la progression du compte, et le
+    passe au forfait supérieur si toutes les missions de ce forfait sont
+    remplies. Le forfait ne redescend JAMAIS automatiquement : une mission
+    remplie reste acquise. Renvoie (raw_stats, upgraded).
+
+    Les stats Opsiom (jours actifs, conversations) sont toujours relues en
+    direct : elles sont locales à Octix, donc gratuites."""
+    now = datetime.datetime.utcnow()
+    cached = None
+    if not force and user.progression_json and user.progression_checked_at:
+        age = (now - user.progression_checked_at).total_seconds()
+        if age < PROGRESSION_TTL_SECONDS:
+            try:
+                cached = json.loads(user.progression_json)
+            except (ValueError, TypeError):
+                cached = None
+
+    if cached is not None:
+        raw = cached
+        raw["opsiom"] = user.opsiom_activity_stats()
+    else:
+        raw = progression.gather_raw_stats(db, user)  # peut faire un rollback interne
+        user.progression_json = json.dumps(raw)
+        user.progression_checked_at = now
+
+    unlocked = plans.compute_unlocked_plan(raw)
+    upgraded = plans.plan_rank(unlocked) > plans.plan_rank(user.plan)
+    if upgraded:
+        user.plan = unlocked
+        user.plan_updated_at = now
+    db.session.commit()
+    return raw, upgraded
+
+
+def _maybe_refresh_progression(user):
+    """Version silencieuse pour les endpoints de quota : ne doit JAMAIS les
+    faire échouer (une source de progression en panne ne doit pas bloquer
+    un message de chat)."""
+    try:
+        _refresh_progression(user)
+    except Exception:
+        db.session.rollback()
+        app.logger.warning("Rafraîchissement de progression échoué", exc_info=True)
+
+
+@app.route("/account/progression", methods=["GET"])
+def account_progression():
+    """Forfait courant + progression vers les forfaits suivants. Accepte un
+    token JWT ou une clé API (comme /account/quota). ?force=1 ignore le cache."""
+    user, error = _resolve_quota_user(request)
+    if error:
+        return jsonify({"error": error}), 401
+
+    raw, upgraded = _refresh_progression(user, force=request.args.get("force") == "1")
+
+    tiers = []
+    for plan_id in plans.PLAN_ORDER[1:]:
+        missions = plans.evaluate_missions(plan_id, raw)
+        cfg = plans.plan_config(plan_id)
+        tiers.append({
+            "id": plan_id,
+            "label": cfg["label"],
+            "emoji": cfg["emoji"],
+            "daily_tokens": cfg["daily_tokens"],
+            "models": cfg["models"],
+            "priority_inference": bool(cfg.get("priority_inference")),
+            "missions": missions,
+            "done_count": sum(1 for m in missions if m["done"]),
+            "total_count": len(missions),
+            "unlocked": plans.plan_rank(user.plan) >= plans.plan_rank(plan_id),
+        })
+
+    current = plans.plan_config(user.plan)
+    return jsonify({
+        "plan": user.plan,
+        "plan_label": current["label"],
+        "plan_emoji": current["emoji"],
+        "models": current["models"],
+        "upgraded": upgraded,
+        "next_plan": plans.next_plan_after(user.plan),
+        "lab": bool(user.lab),
+        "lab_label": plans.LAB_LABEL,
+        "lab_emoji": plans.LAB_EMOJI,
+        "tiers": tiers,
+        "quota": _quota_status(user),
+    })
+
+
+def _admin_only():
+    """Endpoints d'administration : exigent OCTIX_INTERNAL_KEY. Contrairement
+    aux endpoints internes existants, ils REFUSENT de fonctionner si la clé
+    n'est pas définie — accorder un forfait ou Lab ne doit jamais être ouvert."""
+    if not INTERNAL_KEY:
+        return jsonify({"error": "OCTIX_INTERNAL_KEY non défini : endpoint d'administration désactivé"}), 503
+    if request.headers.get("X-Internal-Key") != INTERNAL_KEY:
+        return jsonify({"error": "clé interne invalide"}), 403
+    return None
+
+
+@app.route("/admin/lab", methods=["POST"])
+def admin_set_lab():
+    """Attribue ou retire le statut Lab. Body : {username, lab: true|false}."""
+    denied = _admin_only()
+    if denied:
+        return denied
+    data = request.get_json(silent=True, force=True) or {}
+    user = User.query.filter_by(username=(data.get("username") or "").strip()).first()
+    if not user:
+        return jsonify({"error": "compte introuvable"}), 404
+    user.lab = bool(data.get("lab", True))
+    db.session.commit()
+    return jsonify({"ok": True, "username": user.username, "lab": user.lab})
+
+
+@app.route("/admin/plan", methods=["POST"])
+def admin_set_plan():
+    """Force le forfait d'un compte (dépannage, événements). Body : {username, plan}."""
+    denied = _admin_only()
+    if denied:
+        return denied
+    data = request.get_json(silent=True, force=True) or {}
+    plan_id = (data.get("plan") or "").strip().lower()
+    if plan_id not in plans.PLANS:
+        return jsonify({"error": f"forfait inconnu (attendu : {', '.join(plans.PLAN_ORDER)})"}), 400
+    user = User.query.filter_by(username=(data.get("username") or "").strip()).first()
+    if not user:
+        return jsonify({"error": "compte introuvable"}), 404
+    user.plan = plan_id
+    user.plan_updated_at = datetime.datetime.utcnow()
+    db.session.commit()
+    return jsonify({"ok": True, "username": user.username, "plan": user.plan})
 
 
 @app.route("/complete-profile", methods=["POST"])
