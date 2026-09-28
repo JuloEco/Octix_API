@@ -76,12 +76,8 @@ MISSIONS = {
     "plus": [
         {"key": "learncode_3_lecons", "label": "Terminer 3 leçons LearnCode",
          "stat": "learncode.lessons_completed", "target": 3},
-        {"key": "classroom_1_activite", "label": "Réussir une activité Classroom",
-         "stat": "classroom.activities_passed", "target": 1},
         {"key": "omniamind_1_defi", "label": "Réussir un défi Omnia Mind",
          "stat": "omniamind.challenges_passed", "target": 1},
-        {"key": "opsiom_3_jours", "label": "Utiliser Opsiom 3 jours différents",
-         "stat": "opsiom.active_days", "target": 3},
     ],
     "pro": [
         {"key": "learncode_10_lecons", "label": "Terminer 10 leçons LearnCode",
