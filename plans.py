@@ -23,7 +23,7 @@ PLANS = {
     "free": {
         "label": "Opsiom Free",
         "emoji": "🟢",
-        "daily_tokens": 2000,
+        "daily_tokens": 500,
         "models": ["nano", "small"],
         "description": "Forfait de base, obtenu automatiquement.",
     },

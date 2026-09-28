@@ -76,6 +76,7 @@ Omnia Mind / Opsiom (lues directement dans la base commune, voir progression.py)
     GET  /account/progression[?force=1]  -> forfait courant, missions par forfait,
                                              quota (token JWT ou clé API). Passe le
                                              compte au forfait supérieur si mérité.
+    GET  /admin/progression-debug?username=  -> diagnostic des lectures (X-Internal-Key obligatoire)
     POST /admin/plan  {username, plan}   -> force un forfait   (X-Internal-Key obligatoire)
     POST /admin/lab   {username, lab}    -> statut Opsiom Lab  (X-Internal-Key obligatoire)
 
@@ -118,6 +119,10 @@ def _normalize_db_url(url: str) -> str:
 # - DATABASE_URL : fallback générique si tu utilises Neon/Supabase directement
 # - sqlite en mémoire : UNIQUEMENT pour tourner le code sans base configurée
 #   (tests rapides) — ne jamais utiliser en prod sur Vercel
+DB_ENV_USED = next(
+    (name for name in ("POSTGRES_URL", "DATABASE_URL", "POSTGRES_URL_NON_POOLING") if os.environ.get(name)),
+    "(aucune : sqlite en mémoire)",
+)
 db_uri = (
     os.environ.get("POSTGRES_URL")
     or os.environ.get("DATABASE_URL")
@@ -767,7 +772,24 @@ def account_progression():
         })
 
     current = plans.plan_config(user.plan)
+    sources = {
+        name: {"reachable": bool((raw.get(name) or {}).get("reachable"))}
+        for name in ("learncode", "classroom", "omniamind")
+    }
+    debug = None
+    if request.args.get("debug") == "1" and INTERNAL_KEY and request.headers.get("X-Internal-Key") == INTERNAL_KEY:
+        # Diagnostic réservé à l'admin (X-Internal-Key) : quelle variable
+        # d'environnement Octix utilise, sur quelle base, et l'erreur exacte
+        # de chaque source. Jamais d'identifiants.
+        uri = app.config["SQLALCHEMY_DATABASE_URI"]
+        debug = {
+            "db_env_var": DB_ENV_USED,
+            "db_target": uri.split("@")[-1] if "@" in uri else uri,
+            "raw_stats": raw,
+        }
     return jsonify({
+        "sources": sources,
+        **({"debug": debug} if debug else {}),
         "plan": user.plan,
         "plan_label": current["label"],
         "plan_emoji": current["emoji"],
@@ -791,6 +813,28 @@ def _admin_only():
     if request.headers.get("X-Internal-Key") != INTERNAL_KEY:
         return jsonify({"error": "clé interne invalide"}), 403
     return None
+
+
+@app.route("/admin/progression-debug", methods=["GET"])
+def admin_progression_debug():
+    """Diagnostic sans token utilisateur : GET /admin/progression-debug?username=<pseudo>
+    avec l'en-tête X-Internal-Key. Renvoie la base réellement lue, les tables
+    trouvées, l'erreur exacte de chaque source et les stats calculées."""
+    denied = _admin_only()
+    if denied:
+        return denied
+    username = (request.args.get("username") or "").strip()
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({"error": "compte introuvable dans la base d'Octix", "db_env_var": DB_ENV_USED,
+                        "octix_db": app.config["SQLALCHEMY_DATABASE_URI"].split("@")[-1]}), 404
+    raw = progression.gather_raw_stats(db, user)
+    return jsonify({
+        "db_env_var_octix": DB_ENV_USED,
+        "octix_db": app.config["SQLALCHEMY_DATABASE_URI"].split("@")[-1],
+        "raw_stats": raw,
+        "diagnostic": progression.diagnose(db, username),
+    })
 
 
 @app.route("/admin/lab", methods=["POST"])
