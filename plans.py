@@ -17,6 +17,17 @@ Tout est ici pour rester facile à modifier : quotas, missions et seuils.
 # ---------------------------------------------------------------------------
 # 1. Forfaits — quotas de tokens/jour
 # ---------------------------------------------------------------------------
+import os
+
+# Comptes administrateurs (voir Opsiom-frontend/plans.py, même variable
+# d'environnement) : quota et modèles illimités, y compris pour les appels
+# directs à l'API (CLI, serveur d'inférence), pas seulement depuis le proxy web.
+ADMIN_USERNAMES = {
+    name.strip()
+    for name in os.environ.get("ADMIN_USERNAMES", "Jules").split(",")
+    if name.strip()
+}
+
 PLAN_ORDER = ["free", "plus", "pro"]
 
 PLANS = {
@@ -76,8 +87,12 @@ MISSIONS = {
     "plus": [
         {"key": "learncode_3_lecons", "label": "Terminer 3 leçons LearnCode",
          "stat": "learncode.lessons_completed", "target": 3},
+        {"key": "classroom_1_activite", "label": "Réussir une activité Classroom",
+         "stat": "classroom.activities_passed", "target": 1},
         {"key": "omniamind_1_defi", "label": "Réussir un défi Omnia Mind",
          "stat": "omniamind.challenges_passed", "target": 1},
+        {"key": "opsiom_3_jours", "label": "Utiliser Opsiom 3 jours différents",
+         "stat": "opsiom.active_days", "target": 3},
     ],
     "pro": [
         {"key": "learncode_10_lecons", "label": "Terminer 10 leçons LearnCode",

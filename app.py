@@ -24,7 +24,7 @@ Déploiement sur Vercel :
     1. Ajoute l'intégration "Vercel Postgres" (ou Neon/Supabase) à ton projet
        -> Vercel injecte automatiquement POSTGRES_URL / POSTGRES_URL_NON_POOLING
     2. Définis OCTIX_SECRET_KEY et OCTIX_INTERNAL_KEY dans les variables d'environnement
-       (et, si besoin, DAILY_TOKEN_QUOTA — défaut 500)
+       (et, si besoin, DAILY_TOKEN_QUOTA — défaut 2000 — ou ADMIN_USERNAMES)
     3. Si la table "user" existe déjà (déploiement pré-existant), lance
        migrate_add_email.py, migrate_add_quota.py puis migrate_add_plans.py
        UNE FOIS avant de déployer
@@ -150,7 +150,7 @@ INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
 
 # Quota de tokens/jour partagé par compte (web + CLI + toute autre app qui
 # passe par /account/quota/consume). Il dépend désormais du FORFAIT du compte
-# (voir plans.py : free 500 / plus 10 000 / pro 50 000). Cette variable
+# (voir plans.py : free 2000 / plus 10 000 / pro 50 000). Cette variable
 # d'environnement ne surcharge plus que le forfait "free", pour pouvoir
 # ajuster le quota par défaut sans redéployer le code.
 if os.environ.get("DAILY_TOKEN_QUOTA"):
@@ -555,6 +555,18 @@ def _reset_quota_if_needed(user):
 
 def _quota_status(user):
     _reset_quota_if_needed(user)
+    if user.username in plans.ADMIN_USERNAMES:
+        # Administrateur (voir Opsiom-frontend/plans.py) : aucune limite,
+        # y compris pour un appel direct (CLI, serveur d'inférence) qui ne
+        # passe pas par le proxy web.
+        return {
+            "used": user.tokens_used_today,
+            "limit": 0,
+            "remaining": 10**9,
+            "plan": user.plan,
+            "lab": bool(user.lab),
+            "unlimited": True,
+        }
     limit = plans.daily_tokens_for(user.plan)
     return {
         "used": user.tokens_used_today,
@@ -562,6 +574,7 @@ def _quota_status(user):
         "remaining": max(0, limit - user.tokens_used_today),
         "plan": user.plan,
         "lab": bool(user.lab),
+        "unlimited": False,
     }
 
 
@@ -597,7 +610,8 @@ def account_quota_consume():
 
     _maybe_refresh_progression(user)
     _reset_quota_if_needed(user)
-    if user.tokens_used_today >= plans.daily_tokens_for(user.plan):
+    is_admin = user.username in plans.ADMIN_USERNAMES
+    if not is_admin and user.tokens_used_today >= plans.daily_tokens_for(user.plan):
         db.session.commit()
         return jsonify({"error": "quota quotidien de tokens atteint", "quota": _quota_status(user)}), 429
 

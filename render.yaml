@@ -4,3 +4,6 @@ services:
     env: python
     buildCommand: "pip install gunicorn flask pyjwt"
     startCommand: "gunicorn app:app"
+    envVars:
+      - key: ADMIN_USERNAMES
+        value: "Jules"  # pseudos administrateurs (séparés par des virgules) — même valeur côté Opsiom-frontend
